@@ -1,5 +1,7 @@
 """
 Telegram notifier — zero deps beyond `requests`.
+
+Also supports lightweight polling for inbound commands like /stats.
 """
 from __future__ import annotations
 import requests
@@ -10,6 +12,7 @@ class TelegramNotifier:
         self.token = token
         self.chat_id = str(chat_id)
         self.base = f"https://api.telegram.org/bot{token}"
+        self._last_update_id = 0  # for getUpdates long-poll cursor
 
     def send(self, text: str) -> None:
         try:
@@ -60,9 +63,94 @@ class TelegramNotifier:
         )
         self.send(msg)
 
-    def send_startup(self, symbol: str, bayes_summary: str) -> None:
+    def send_startup(self, symbols, bayes_summary: str) -> None:
+        if isinstance(symbols, (list, tuple)):
+            symstr = ", ".join(symbols)
+        else:
+            symstr = symbols
         self.send(
             f"🤖 *J-Dawg Bot online*\n"
-            f"Watching *{symbol}* on 5m with 1H bias filter.\n\n"
+            f"Watching *{symstr}* on 5m with 1H bias filter.\n\n"
             f"```\n{bayes_summary}\n```"
         )
+
+    def send_daily_summary(self, date_str: str, rows: list, per_symbol: dict) -> None:
+        wins = sum(1 for r in rows if r["outcome"] == "win")
+        losses = sum(1 for r in rows if r["outcome"] == "loss")
+        total_r = sum((r["pnl_r"] or 0.0) for r in rows)
+        n = wins + losses
+        wr = (wins / n * 100) if n else 0.0
+        body = (
+            f"Trades : {n}\n"
+            f"Wins   : {wins}\n"
+            f"Losses : {losses}\n"
+            f"Win %  : {wr:.1f}%\n"
+            f"Net R  : {total_r:+.2f}"
+        )
+        per_lines = []
+        for sym, s in per_symbol.items():
+            sn = s["wins"] + s["losses"]
+            swr = (s["wins"] / sn * 100) if sn else 0.0
+            per_lines.append(f"{sym:<8} {sn:>2}t  {swr:5.1f}%  {s['pnl_r']:+.2f}R")
+        per_block = ("\n".join(per_lines)) if per_lines else "(no trades)"
+        self.send(
+            f"📊 *Daily P&L — {date_str}*\n"
+            f"```\n{body}\n```\n"
+            f"*Per symbol:*\n```\n{per_block}\n```"
+        )
+
+    def send_stats(self, overall: dict, per_symbol: dict, bayes_summary: str) -> None:
+        n = overall["wins"] + overall["losses"]
+        wr = (overall["wins"] / n * 100) if n else 0.0
+        body = (
+            f"Total trades : {n}\n"
+            f"Wins         : {overall['wins']}\n"
+            f"Losses       : {overall['losses']}\n"
+            f"Pending      : {overall['pending']}\n"
+            f"Win %        : {wr:.1f}%\n"
+            f"Net R        : {overall['total_r']:+.2f}"
+        )
+        per_lines = []
+        for sym, s in per_symbol.items():
+            sn = s["wins"] + s["losses"]
+            swr = (s["wins"] / sn * 100) if sn else 0.0
+            per_lines.append(f"{sym:<8} {sn:>3}t  {swr:5.1f}%  {s['total_r']:+.2f}R")
+        per_block = ("\n".join(per_lines)) if per_lines else "(no trades)"
+        self.send(
+            f"📈 *J-Dawg stats*\n"
+            f"```\n{body}\n```\n"
+            f"*Per symbol:*\n```\n{per_block}\n```\n"
+            f"*Bayesian:*\n```\n{bayes_summary}\n```"
+        )
+
+    # ---------- inbound polling ----------
+    def poll_commands(self) -> list[str]:
+        """
+        Returns the list of NEW message texts since last call (only from configured chat).
+        Non-blocking: uses short timeout so it slots into the main loop cleanly.
+        """
+        try:
+            r = requests.get(
+                f"{self.base}/getUpdates",
+                params={"offset": self._last_update_id + 1, "timeout": 0},
+                timeout=5,
+            )
+            if r.status_code != 200:
+                return []
+            data = r.json()
+            if not data.get("ok"):
+                return []
+            texts: list[str] = []
+            for upd in data.get("result", []):
+                self._last_update_id = max(self._last_update_id, upd["update_id"])
+                msg = upd.get("message") or upd.get("edited_message") or {}
+                chat = msg.get("chat", {})
+                if str(chat.get("id")) != self.chat_id:
+                    continue
+                text = msg.get("text")
+                if text:
+                    texts.append(text.strip())
+            return texts
+        except Exception as e:
+            print(f"[telegram] poll error: {e}")
+            return []

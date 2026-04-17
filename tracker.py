@@ -105,17 +105,33 @@ class Tracker:
             ).fetchone()
             return row is not None
 
-    def recent_stats(self) -> dict:
+    def recent_stats(self, symbol: str | None = None) -> dict:
+        sql = """SELECT
+                    SUM(CASE WHEN outcome='win'  THEN 1 ELSE 0 END) AS wins,
+                    SUM(CASE WHEN outcome='loss' THEN 1 ELSE 0 END) AS losses,
+                    SUM(CASE WHEN outcome='pending' THEN 1 ELSE 0 END) AS pending,
+                    SUM(pnl_r) AS total_r
+                FROM signals"""
+        params: tuple = ()
+        if symbol:
+            sql += " WHERE symbol=?"
+            params = (symbol,)
         with self._conn() as c:
-            row = c.execute(
-                """SELECT
-                        SUM(CASE WHEN outcome='win'  THEN 1 ELSE 0 END) AS wins,
-                        SUM(CASE WHEN outcome='loss' THEN 1 ELSE 0 END) AS losses,
-                        SUM(CASE WHEN outcome='pending' THEN 1 ELSE 0 END) AS pending,
-                        SUM(pnl_r) AS total_r
-                   FROM signals"""
-            ).fetchone()
+            row = c.execute(sql, params).fetchone()
             return {k: row[k] or 0 for k in row.keys()}
+
+    def closed_between(self, start_iso: str, end_iso: str) -> list[sqlite3.Row]:
+        """Signals that were closed (win/loss) within the given UTC window."""
+        with self._conn() as c:
+            return list(
+                c.execute(
+                    """SELECT * FROM signals
+                       WHERE outcome IN ('win','loss')
+                         AND closed_at >= ? AND closed_at < ?
+                       ORDER BY closed_at""",
+                    (start_iso, end_iso),
+                )
+            )
 
 
 def check_outcome(row: sqlite3.Row, df: pd.DataFrame) -> tuple[str, float] | None:

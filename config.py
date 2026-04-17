@@ -5,7 +5,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- Market ---
-SYMBOL = os.getenv("SYMBOL", "NQ=F")         # NASDAQ 100 E-mini Futures on Yahoo
+# SYMBOLS = comma-separated list. SYMBOL kept for backwards compat / single-symbol use.
+SYMBOL = os.getenv("SYMBOL", "NQ=F")           # NASDAQ 100 E-mini Futures on Yahoo
+SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", f"{SYMBOL},QQQ").split(",") if s.strip()]
 FVG_TIMEFRAME = "5m"
 BIAS_TIMEFRAME = "1h"
 BIAS_EMA_PERIOD = 50
@@ -39,3 +41,7 @@ BAYES_MODEL_PATH = os.getenv("BAYES_MODEL_PATH", "bayes_model.json")
 
 # --- Loop ---
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
+
+# --- Daily summary ---
+# When (ET) to push the daily P&L recap to Telegram. 16:15 = 15 min after NYSE close.
+DAILY_SUMMARY_TIME = os.getenv("DAILY_SUMMARY_TIME", "16:15")
