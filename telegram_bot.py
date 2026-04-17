@@ -42,24 +42,60 @@ class TelegramNotifier:
         confidence: float,
         reason: str,
         samples: int,
+        tick_size: float = 0.01,
+        paper: bool = True,
     ) -> None:
         emoji = "🟢" if side == "long" else "🔴"
         arrow = "▲" if side == "long" else "▼"
         rr_risk = abs(entry - stop)
         reward = abs(target - entry)
         rr = reward / rr_risk if rr_risk else 0.0
+        risk_ticks = rr_risk / tick_size if tick_size else 0.0
+        reward_ticks = reward / tick_size if tick_size else 0.0
+        header = "📒 *PAPER OPEN*" if paper else "📣 *SIGNAL*"
 
         msg = (
-            f"{emoji} *PB THEORY {side.upper()} — {symbol}* {arrow}\n"
+            f"{header}  {emoji} *{side.upper()} — {symbol}* {arrow}\n"
             f"```\n"
             f"Entry  : {entry:,.2f}\n"
-            f"Stop   : {stop:,.2f}\n"
-            f"Target : {target:,.2f}\n"
+            f"Stop   : {stop:,.2f}  ({risk_ticks:.0f} ticks risk)\n"
+            f"Target : {target:,.2f}  ({reward_ticks:.0f} ticks goal)\n"
             f"R:R    : 1:{rr:.2f}\n"
             f"```\n"
             f"*Model confidence:* `{confidence*100:.1f}%`  "
             f"_(after {samples} closed trades)_\n"
             f"*Setup:* {reason}"
+        )
+        self.send(msg)
+
+    def send_close(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        entry: float,
+        exit_price: float,
+        pnl_r: float,
+        exit_reason: str,
+        tick_size: float,
+        held: str,
+    ) -> None:
+        if side == "long":
+            ticks = (exit_price - entry) / tick_size if tick_size else 0.0
+        else:
+            ticks = (entry - exit_price) / tick_size if tick_size else 0.0
+        won = pnl_r > 0
+        emoji = "✅" if won else "❌"
+        verdict = "WIN" if won else "LOSS"
+        msg = (
+            f"{emoji} *PAPER CLOSE — {symbol} {side.upper()}*  ({verdict})\n"
+            f"```\n"
+            f"Entry  : {entry:,.2f}\n"
+            f"Exit   : {exit_price:,.2f}\n"
+            f"P&L    : {ticks:+.0f} ticks  ({pnl_r:+.2f}R)\n"
+            f"Held   : {held}\n"
+            f"Reason : {exit_reason}\n"
+            f"```"
         )
         self.send(msg)
 
@@ -99,7 +135,7 @@ class TelegramNotifier:
             f"*Per symbol:*\n```\n{per_block}\n```"
         )
 
-    def send_stats(self, overall: dict, per_symbol: dict, bayes_summary: str) -> None:
+    def send_stats(self, overall: dict, per_symbol: dict, bayes_summary: str, thresholds: dict | None = None) -> None:
         n = overall["wins"] + overall["losses"]
         wr = (overall["wins"] / n * 100) if n else 0.0
         body = (
@@ -116,11 +152,16 @@ class TelegramNotifier:
             swr = (s["wins"] / sn * 100) if sn else 0.0
             per_lines.append(f"{sym:<8} {sn:>3}t  {swr:5.1f}%  {s['total_r']:+.2f}R")
         per_block = ("\n".join(per_lines)) if per_lines else "(no trades)"
+        thresh_block = ""
+        if thresholds:
+            tlines = [f"{k:<20} {v:.2f}" for k, v in sorted(thresholds.items())]
+            thresh_block = f"\n*Adaptive thresholds:*\n```\n" + "\n".join(tlines) + "\n```"
         self.send(
             f"📈 *J-Dawg stats*\n"
             f"```\n{body}\n```\n"
             f"*Per symbol:*\n```\n{per_block}\n```\n"
             f"*Bayesian:*\n```\n{bayes_summary}\n```"
+            f"{thresh_block}"
         )
 
     # ---------- inbound polling ----------

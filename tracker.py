@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS signals (
     reason          TEXT,
     outcome         TEXT    DEFAULT 'pending', -- 'win' | 'loss' | 'pending'
     pnl_r           REAL,
+    exit_price      REAL,                    -- realised fill (paper)
     closed_at       TEXT,
     bar_ts          TEXT                     -- which bar triggered it
 );
@@ -37,12 +38,22 @@ CREATE INDEX IF NOT EXISTS idx_signals_outcome ON signals(outcome);
 CREATE INDEX IF NOT EXISTS idx_signals_bar_ts  ON signals(bar_ts);
 """
 
+_MIGRATIONS = [
+    "ALTER TABLE signals ADD COLUMN exit_price REAL",
+]
+
 
 class Tracker:
     def __init__(self, db_path: str = config.DB_PATH):
         self.db_path = db_path
         with self._conn() as c:
             c.executescript(_SCHEMA)
+            # Idempotent migrations for older databases
+            for stmt in _MIGRATIONS:
+                try:
+                    c.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass  # column already exists
 
     @contextmanager
     def _conn(self):
@@ -85,11 +96,19 @@ class Tracker:
             )
             return cur.lastrowid
 
-    def close_signal(self, signal_id: int, outcome: str, pnl_r: float) -> None:
+    def close_signal(self, signal_id: int, outcome: str, pnl_r: float, exit_price: float | None = None) -> None:
         with self._conn() as c:
             c.execute(
-                """UPDATE signals SET outcome=?, pnl_r=?, closed_at=? WHERE id=?""",
-                (outcome, float(pnl_r), datetime.now(timezone.utc).isoformat(), signal_id),
+                """UPDATE signals
+                   SET outcome=?, pnl_r=?, exit_price=?, closed_at=?
+                   WHERE id=?""",
+                (
+                    outcome,
+                    float(pnl_r),
+                    float(exit_price) if exit_price is not None else None,
+                    datetime.now(timezone.utc).isoformat(),
+                    signal_id,
+                ),
             )
 
     # ---------- reads ----------
@@ -134,16 +153,15 @@ class Tracker:
             )
 
 
-def check_outcome(row: sqlite3.Row, df: pd.DataFrame) -> tuple[str, float] | None:
+def check_outcome(row: sqlite3.Row, df: pd.DataFrame) -> tuple[str, float, float, str] | None:
     """
     Given a pending signal and fresh price data, decide if it hit target/stop or timed out.
-    Returns (outcome, pnl_r) or None if still open.
+    Returns (outcome, pnl_r, exit_price, exit_reason) or None if still open.
     """
     ts = datetime.fromisoformat(row["ts"])
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
 
-    # slice price action since the signal fired
     idx = df.index
     if idx.tz is None:
         idx_utc = idx.tz_localize("UTC")
@@ -159,7 +177,6 @@ def check_outcome(row: sqlite3.Row, df: pd.DataFrame) -> tuple[str, float] | Non
     stop = row["stop"]
     target = row["target"]
 
-    # Detect whichever happened first, bar-by-bar
     for _, bar in since.iterrows():
         if side == "long":
             hit_stop = bar["Low"] <= stop
@@ -169,42 +186,49 @@ def check_outcome(row: sqlite3.Row, df: pd.DataFrame) -> tuple[str, float] | Non
             hit_target = bar["Low"] <= target
 
         if hit_stop and hit_target:
-            # both in same bar — assume stop hit first (conservative)
-            return "loss", -1.0
+            return "loss", -1.0, float(stop), "stop (same-bar conflict)"
         if hit_stop:
-            return "loss", -1.0
+            return "loss", -1.0, float(stop), "stop hit"
         if hit_target:
-            return "win", float(config.RISK_RR)
+            return "win", float(config.RISK_RR), float(target), "target hit"
 
-    # timeout?
     age = datetime.now(timezone.utc) - ts
     if age > timedelta(hours=config.SIGNAL_TIMEOUT_HOURS):
-        last = since.iloc[-1]["Close"]
+        last = float(since.iloc[-1]["Close"])
         risk = abs(entry - stop)
         if risk == 0:
-            return "loss", 0.0
+            return "loss", 0.0, last, "timeout (zero risk)"
         if side == "long":
             pnl_r = (last - entry) / risk
         else:
             pnl_r = (entry - last) / risk
-        return ("win" if pnl_r > 0 else "loss", float(pnl_r))
+        return ("win" if pnl_r > 0 else "loss", float(pnl_r), last, "timeout")
 
     return None
 
 
-def reconcile_pending(tracker: Tracker, df: pd.DataFrame, bayes) -> int:
+def reconcile_pending(tracker: Tracker, df: pd.DataFrame, bayes, on_close=None, symbol: str | None = None) -> int:
     """
     Close out any pending signals whose outcome is now known, and feed the Bayesian model.
-    Returns number of signals closed.
+    If `symbol` is given, only reconciles signals for that symbol (others are skipped — their
+    own loop iteration will pick them up with the right price data).
+    `on_close(row, outcome, pnl_r, exit_price, exit_reason)` fires per closure.
     """
     closed = 0
     for row in tracker.pending_signals():
+        if symbol is not None and row["symbol"] != symbol:
+            continue
         result = check_outcome(row, df)
         if result is None:
             continue
-        outcome, pnl_r = result
-        tracker.close_signal(row["id"], outcome, pnl_r)
-        bayes.update(row["side"], outcome == "win")
+        outcome, pnl_r, exit_price, exit_reason = result
+        tracker.close_signal(row["id"], outcome, pnl_r, exit_price)
+        bayes.update(row["symbol"], row["side"], outcome == "win")
+        if on_close:
+            try:
+                on_close(row, outcome, pnl_r, exit_price, exit_reason)
+            except Exception as e:
+                print(f"[reconcile] on_close error: {e}")
         closed += 1
     if closed > 0:
         bayes.save()

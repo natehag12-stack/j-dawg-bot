@@ -1,76 +1,91 @@
 """
-Self-teaching layer.
+Self-teaching layer (per symbol, per side).
 
-We model each side (long / short) as a Beta-Bernoulli process:
-    - Prior:  Beta(alpha=1, beta=1)  (uniform — no info)
-    - Each trade outcome (win=1 / loss=0) is a Bernoulli trial
-    - Posterior after n observations: Beta(alpha + wins, beta + losses)
+Each (symbol, side) is a Beta-Bernoulli process:
+    Prior: Beta(1, 1)  →  Posterior: Beta(1 + wins, 1 + losses)
 
-Posterior mean = alpha / (alpha + beta) = current win rate estimate.
-Lower credible bound = conservative estimate (bot waits for evidence).
+Posterior mean = current win-rate estimate.
+Lower credible bound = conservative estimate (waits for evidence).
 
-The bot gates alerts on the posterior:
-    - Early (no data): posterior ~ 0.5 → will alert
-    - After losses: posterior drops → bot suppresses signals until win rate improves
-    - After wins: posterior rises → bot becomes more confident
+Stored as JSON:
+    {"symbols": {"NQ=F": {"alpha_long": 4, "beta_long": 2, ...}, "QQQ": {...}}}
 
-This is literal self-teaching: the model rewires its own alert threshold from lived experience.
+Old single-symbol JSON format is auto-migrated on load.
 """
 from __future__ import annotations
 import json
 import os
-from dataclasses import dataclass, asdict
+from typing import Iterable
 from scipy import stats
 
 import config
 
 
-@dataclass
-class BayesianModel:
-    alpha_long: float = 1.0
-    beta_long: float = 1.0
-    alpha_short: float = 1.0
-    beta_short: float = 1.0
+_LEGACY_KEY = "_legacy"
 
-    # ---------- Queries ----------
-    def posterior_mean(self, side: str) -> float:
-        a, b = self._params(side)
+
+def _new_state() -> dict:
+    return {
+        "alpha_long": 1.0,
+        "beta_long": 1.0,
+        "alpha_short": 1.0,
+        "beta_short": 1.0,
+    }
+
+
+class BayesianModel:
+    """Container for per-symbol Beta-Bernoulli state."""
+
+    def __init__(self, symbols: dict[str, dict] | None = None):
+        self.symbols: dict[str, dict] = symbols or {}
+
+    # ---------- accessors ----------
+    def _state(self, symbol: str) -> dict:
+        if symbol not in self.symbols:
+            self.symbols[symbol] = _new_state()
+        return self.symbols[symbol]
+
+    def _params(self, symbol: str, side: str) -> tuple[float, float]:
+        st = self._state(symbol)
+        if side == "long":
+            return st["alpha_long"], st["beta_long"]
+        if side == "short":
+            return st["alpha_short"], st["beta_short"]
+        raise ValueError(f"unknown side: {side}")
+
+    def posterior_mean(self, symbol: str, side: str) -> float:
+        a, b = self._params(symbol, side)
         return a / (a + b)
 
-    def posterior_lcb(self, side: str, alpha: float = config.CREDIBLE_ALPHA) -> float:
-        """Lower bound of (1 - alpha) credible interval. More conservative."""
-        a, b = self._params(side)
+    def posterior_lcb(self, symbol: str, side: str, alpha: float = config.CREDIBLE_ALPHA) -> float:
+        a, b = self._params(symbol, side)
         return float(stats.beta.ppf(alpha, a, b))
 
-    def confidence(self, side: str) -> float:
-        """The score the bot uses to gate alerts."""
+    def confidence(self, symbol: str, side: str) -> float:
         if config.USE_LCB:
-            return self.posterior_lcb(side)
-        return self.posterior_mean(side)
+            return self.posterior_lcb(symbol, side)
+        return self.posterior_mean(symbol, side)
 
-    def samples(self, side: str) -> int:
-        a, b = self._params(side)
-        return int(a + b - 2)  # subtract uniform prior
+    def samples(self, symbol: str, side: str) -> int:
+        a, b = self._params(symbol, side)
+        return int(a + b - 2)
 
-    # ---------- Updates ----------
-    def update(self, side: str, won: bool) -> None:
-        if side == "long":
-            if won:
-                self.alpha_long += 1
-            else:
-                self.beta_long += 1
-        elif side == "short":
-            if won:
-                self.alpha_short += 1
-            else:
-                self.beta_short += 1
-        else:
+    # ---------- updates ----------
+    def update(self, symbol: str, side: str, won: bool) -> None:
+        st = self._state(symbol)
+        key_a = f"alpha_{side}"
+        key_b = f"beta_{side}"
+        if key_a not in st:
             raise ValueError(f"unknown side: {side}")
+        if won:
+            st[key_a] += 1
+        else:
+            st[key_b] += 1
 
-    # ---------- Persistence ----------
+    # ---------- persistence ----------
     def save(self, path: str = config.BAYES_MODEL_PATH) -> None:
         with open(path, "w") as f:
-            json.dump(asdict(self), f, indent=2)
+            json.dump({"symbols": self.symbols}, f, indent=2)
 
     @classmethod
     def load(cls, path: str = config.BAYES_MODEL_PATH) -> "BayesianModel":
@@ -79,22 +94,37 @@ class BayesianModel:
         try:
             with open(path) as f:
                 data = json.load(f)
-            return cls(**data)
         except Exception:
             return cls()
 
-    # ---------- helpers ----------
-    def _params(self, side: str) -> tuple[float, float]:
-        if side == "long":
-            return self.alpha_long, self.beta_long
-        if side == "short":
-            return self.alpha_short, self.beta_short
-        raise ValueError(f"unknown side: {side}")
+        # New format
+        if isinstance(data, dict) and "symbols" in data:
+            return cls(symbols={k: {**_new_state(), **v} for k, v in data["symbols"].items()})
 
-    def summary(self) -> str:
-        return (
-            f"LONG  — wins={self.alpha_long - 1:.0f} losses={self.beta_long - 1:.0f} "
-            f"mean={self.posterior_mean('long'):.2f} lcb={self.posterior_lcb('long'):.2f}  |  "
-            f"SHORT — wins={self.alpha_short - 1:.0f} losses={self.beta_short - 1:.0f} "
-            f"mean={self.posterior_mean('short'):.2f} lcb={self.posterior_lcb('short'):.2f}"
-        )
+        # Legacy format: single global state
+        if isinstance(data, dict) and "alpha_long" in data:
+            return cls(symbols={_LEGACY_KEY: {**_new_state(), **data}})
+
+        return cls()
+
+    # ---------- summary ----------
+    def summary(self, symbols: Iterable[str] | None = None) -> str:
+        if symbols is None:
+            keys = list(self.symbols.keys()) or [_LEGACY_KEY]
+        else:
+            keys = list(symbols)
+        lines = []
+        for sym in keys:
+            wL = self._state(sym)["alpha_long"] - 1
+            lL = self._state(sym)["beta_long"] - 1
+            wS = self._state(sym)["alpha_short"] - 1
+            lS = self._state(sym)["beta_short"] - 1
+            mL = self.posterior_mean(sym, "long")
+            cL = self.posterior_lcb(sym, "long")
+            mS = self.posterior_mean(sym, "short")
+            cS = self.posterior_lcb(sym, "short")
+            lines.append(
+                f"{sym:<8} L:{int(wL)}-{int(lL)} mean={mL:.2f} lcb={cL:.2f}  "
+                f"S:{int(wS)}-{int(lS)} mean={mS:.2f} lcb={cS:.2f}"
+            )
+        return "\n".join(lines)

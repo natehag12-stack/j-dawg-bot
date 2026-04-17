@@ -4,4 +4,6 @@ __pycache__/
 *.pyc
 trades.db
 bayes_model.json
+tuner_state.json
 *.log
+logs/

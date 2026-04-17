@@ -1,14 +1,19 @@
 """
-J-Dawg Bot — live loop.
+J-Dawg Bot — live loop (paper trading mode).
 
 Every POLL_INTERVAL_SECONDS:
-    1. For each configured symbol:
+    1. Poll Telegram for inbound commands (/status, /stats, /pnl, /help)
+    2. For each configured symbol:
         a. Fetch latest 5m + 1H data
-        b. Reconcile outcomes of any pending signals → feed Bayesian model
-        c. Evaluate the last CLOSED 5m bar for a long/short entry condition
-        d. If condition fires AND Bayesian confidence passes threshold → alert Telegram + log to DB
-    2. Handle inbound Telegram commands (/stats)
-    3. Once per day at DAILY_SUMMARY_TIME ET → push P&L recap to Telegram
+        b. Reconcile any pending paper positions (push CLOSE notify with tick P&L)
+        c. Recompute the adaptive threshold for each side
+        d. Evaluate the last CLOSED 5m bar for a long/short entry
+        e. If condition fires AND Bayesian confidence ≥ adaptive threshold →
+           push OPEN notify + log to DB
+    3. Once per ET day at DAILY_SUMMARY_TIME → push P&L recap
+
+The bot does not place real orders — paper trading is the only mode. It is
+designed to run forever; on any exception the loop logs, alerts, and continues.
 """
 from __future__ import annotations
 import time
@@ -25,10 +30,10 @@ from indicators import atr as atr_fn
 from bayesian import BayesianModel
 from tracker import Tracker, reconcile_pending
 from telegram_bot import TelegramNotifier
+from tuner import ThresholdTuner
 
 
 def compute_targets(df: pd.DataFrame, side: str, atr_val: float) -> tuple[float, float, float]:
-    """Entry = close of trigger bar. Stop = bar extreme ± 0.5 ATR. Target = RR multiple."""
     last = df.iloc[-1]
     entry = float(last["Close"])
     if side == "long":
@@ -45,48 +50,93 @@ def compute_targets(df: pd.DataFrame, side: str, atr_val: float) -> tuple[float,
 def run() -> None:
     tracker = Tracker()
     bayes = BayesianModel.load()
+    tuner = ThresholdTuner.load()
 
     notifier = None
     if config.TELEGRAM_TOKEN and config.TELEGRAM_CHAT_ID:
         notifier = TelegramNotifier(config.TELEGRAM_TOKEN, config.TELEGRAM_CHAT_ID)
-        notifier.send_startup(config.SYMBOLS, bayes.summary())
+        notifier.send_startup(config.SYMBOLS, bayes.summary(config.SYMBOLS))
     else:
         print("⚠️  TELEGRAM_TOKEN / TELEGRAM_CHAT_ID not set — alerts will print to console only.")
 
     print(f"[{datetime.now().isoformat(timespec='seconds')}] J-Dawg Bot online.")
-    print(f"Symbols: {config.SYMBOLS} | Poll every {config.POLL_INTERVAL_SECONDS}s")
-    print(f"Bayes: {bayes.summary()}")
+    print(f"Symbols: {config.SYMBOLS} | Poll every {config.POLL_INTERVAL_SECONDS}s | "
+          f"Paper={config.PAPER_TRADING} | Adaptive={config.ADAPTIVE_THRESHOLD}")
+    print(bayes.summary(config.SYMBOLS))
 
     last_summary_date: date_cls | None = None
+    consecutive_errors = 0
 
     while True:
         try:
+            # 1. Inbound commands first so /status feels snappy
+            if notifier:
+                handle_commands(notifier, tracker, bayes, tuner)
+
+            # 2. Per-symbol work
             for symbol in config.SYMBOLS:
                 try:
-                    loop_once(symbol, tracker, bayes, notifier)
+                    loop_once(symbol, tracker, bayes, tuner, notifier)
                 except Exception as e:
                     print(f"[error {symbol}] {e}\n{traceback.format_exc()}")
                     if notifier:
                         notifier.send(f"⚠️ Bot error on `{symbol}`: `{e}`")
 
+            # 3. Daily recap
             if notifier:
-                handle_commands(notifier, tracker, bayes)
                 last_summary_date = maybe_send_daily_summary(notifier, tracker, last_summary_date)
+
+            consecutive_errors = 0  # healthy tick
 
         except KeyboardInterrupt:
             print("\n[shutdown] bye.")
             return
         except Exception as e:
+            consecutive_errors += 1
             print(f"[error] {e}\n{traceback.format_exc()}")
             if notifier:
-                notifier.send(f"⚠️ Bot error: `{e}`")
+                notifier.send(f"⚠️ Bot error: `{e}` (#{consecutive_errors})")
+            # Self-healing: exponential backoff on repeated failure
+            if consecutive_errors >= 3:
+                backoff = min(300, config.POLL_INTERVAL_SECONDS * (2 ** (consecutive_errors - 2)))
+                print(f"[self-heal] backing off {backoff}s")
+                time.sleep(backoff)
+                continue
+
         time.sleep(config.POLL_INTERVAL_SECONDS)
+
+
+def _close_callback(notifier, symbol):
+    """Build a per-symbol close-notification callback."""
+    def _on_close(row, outcome, pnl_r, exit_price, exit_reason):
+        if not (notifier and config.PAPER_TRADING):
+            return
+        ts = datetime.fromisoformat(row["ts"])
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        held = datetime.now(timezone.utc) - ts
+        # human-readable held duration
+        h, rem = divmod(int(held.total_seconds()), 3600)
+        m, _ = divmod(rem, 60)
+        held_str = f"{h}h {m}m" if h else f"{m}m"
+        notifier.send_close(
+            symbol=symbol,
+            side=row["side"],
+            entry=row["entry"],
+            exit_price=exit_price,
+            pnl_r=pnl_r,
+            exit_reason=exit_reason,
+            tick_size=config.tick_size(symbol),
+            held=held_str,
+        )
+    return _on_close
 
 
 def loop_once(
     symbol: str,
     tracker: Tracker,
     bayes: BayesianModel,
+    tuner: ThresholdTuner,
     notifier: TelegramNotifier | None,
 ) -> None:
     df_5m, df_1h = fetch_all(symbol)
@@ -94,9 +144,21 @@ def loop_once(
         print(f"[warn {symbol}] not enough data yet")
         return
 
-    closed = reconcile_pending(tracker, df_5m, bayes)
+    closed = reconcile_pending(
+        tracker,
+        df_5m,
+        bayes,
+        on_close=_close_callback(notifier, symbol),
+        symbol=symbol,
+    )
     if closed > 0:
-        print(f"[reconcile {symbol}] closed {closed} signals → {bayes.summary()}")
+        print(f"[reconcile {symbol}] closed {closed}")
+
+    # Recompute adaptive thresholds after any closures
+    if config.ADAPTIVE_THRESHOLD and closed > 0:
+        for side in ("long", "short"):
+            new_t = tuner.recompute(tracker, symbol, side)
+            print(f"[tune {symbol} {side}] threshold → {new_t:.2f}")
 
     result = generate_signals(df_5m, df_1h)
     long_cond = result["long_cond"]
@@ -111,7 +173,6 @@ def loop_once(
         side = "long"
     elif short_cond.iloc[idx]:
         side = "short"
-
     if side is None:
         return
 
@@ -127,20 +188,21 @@ def loop_once(
     df_slice = df_5m.iloc[: idx + 1]
     entry, stop, target = compute_targets(df_slice, side, atr_val)
 
-    confidence = bayes.confidence(side)
-    n_samples = bayes.samples(side)
+    confidence = bayes.confidence(symbol, side)
+    n_samples = bayes.samples(symbol, side)
     reason = explain(comp, idx)
+    threshold = tuner.threshold(symbol, side) if config.ADAPTIVE_THRESHOLD else config.MIN_POSTERIOR_TO_ALERT
 
     log_line = (
         f"[{datetime.now().isoformat(timespec='seconds')}] "
         f"SIGNAL {symbol} {side.upper()} @ {bar_ts.isoformat()} "
         f"entry={entry:.2f} stop={stop:.2f} target={target:.2f} "
-        f"conf={confidence:.2f} n={n_samples} → {reason}"
+        f"conf={confidence:.2f} thr={threshold:.2f} n={n_samples} → {reason}"
     )
     print(log_line)
 
-    if confidence < config.MIN_POSTERIOR_TO_ALERT:
-        print(f"[skip {symbol}] confidence {confidence:.2f} < {config.MIN_POSTERIOR_TO_ALERT}")
+    if confidence < threshold:
+        print(f"[skip {symbol}] confidence {confidence:.2f} < threshold {threshold:.2f}")
         return
 
     tracker.log_signal(
@@ -164,25 +226,42 @@ def loop_once(
             confidence=confidence,
             reason=reason,
             samples=n_samples,
+            tick_size=config.tick_size(symbol),
+            paper=config.PAPER_TRADING,
         )
 
 
 # ---------- inbound commands ----------
+_STATS_CMDS = {"/status", "/stats", "/pnl"}
+_HELP_CMDS = {"/start", "/help"}
+
+
 def handle_commands(
     notifier: TelegramNotifier,
     tracker: Tracker,
     bayes: BayesianModel,
+    tuner: ThresholdTuner,
 ) -> None:
     for text in notifier.poll_commands():
-        cmd = text.split()[0].lower()
-        if cmd in ("/stats", "/stats@" + (notifier.chat_id or "")):
+        # strip @botname suffix Telegram appends in groups
+        cmd = text.split()[0].lower().split("@")[0]
+        if cmd in _STATS_CMDS:
             overall = tracker.recent_stats()
             per_symbol = {s: tracker.recent_stats(s) for s in config.SYMBOLS}
-            notifier.send_stats(overall, per_symbol, bayes.summary())
-        elif cmd == "/start" or cmd == "/help":
+            thresholds = tuner.snapshot() if config.ADAPTIVE_THRESHOLD else None
+            notifier.send_stats(
+                overall,
+                per_symbol,
+                bayes.summary(config.SYMBOLS),
+                thresholds=thresholds,
+            )
+        elif cmd in _HELP_CMDS:
             notifier.send(
                 "*J-Dawg commands*\n"
-                "/stats — current win rate and P&L\n"
+                "/status — current win rate, P&L, and adaptive thresholds\n"
+                "/stats  — alias for /status\n"
+                "/pnl    — alias for /status\n"
+                "/help   — this message"
             )
 
 
@@ -192,7 +271,6 @@ def maybe_send_daily_summary(
     tracker: Tracker,
     last_summary_date: date_cls | None,
 ) -> date_cls | None:
-    """Send one summary per trading day once ET time passes DAILY_SUMMARY_TIME."""
     tz = pytz.timezone(config.SESSION_TZ)
     now_et = datetime.now(tz)
     hh, mm = map(int, config.DAILY_SUMMARY_TIME.split(":"))
@@ -203,7 +281,6 @@ def maybe_send_daily_summary(
     if last_summary_date == now_et.date():
         return last_summary_date
 
-    # Window: from this-day trigger back 24h (in UTC, which is how closed_at is stored).
     end_utc = trigger_et.astimezone(timezone.utc)
     start_utc = end_utc - timedelta(hours=24)
     rows = tracker.closed_between(start_utc.isoformat(), end_utc.isoformat())
