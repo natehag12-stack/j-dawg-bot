@@ -66,25 +66,28 @@ def run() -> None:
 
     last_summary_date: date_cls | None = None
     consecutive_errors = 0
+    last_market_tick = 0.0  # forces an immediate market pass on first iter
 
     while True:
         try:
-            # 1. Inbound commands first so /status feels snappy
+            # 1. Inbound commands every COMMAND_POLL_INTERVAL_SECONDS (snappy)
             if notifier:
                 handle_commands(notifier, tracker, bayes, tuner)
 
-            # 2. Per-symbol work
-            for symbol in config.SYMBOLS:
-                try:
-                    loop_once(symbol, tracker, bayes, tuner, notifier)
-                except Exception as e:
-                    print(f"[error {symbol}] {e}\n{traceback.format_exc()}")
-                    if notifier:
-                        notifier.send(f"⚠️ Bot error on `{symbol}`: `{e}`")
+            # 2. Market data + signal eval at the slower POLL_INTERVAL_SECONDS
+            now = time.time()
+            if now - last_market_tick >= config.POLL_INTERVAL_SECONDS:
+                last_market_tick = now
+                for symbol in config.SYMBOLS:
+                    try:
+                        loop_once(symbol, tracker, bayes, tuner, notifier)
+                    except Exception as e:
+                        print(f"[error {symbol}] {e}\n{traceback.format_exc()}")
+                        if notifier:
+                            notifier.send(f"⚠️ Bot error on `{symbol}`: `{e}`")
 
-            # 3. Daily recap
-            if notifier:
-                last_summary_date = maybe_send_daily_summary(notifier, tracker, last_summary_date)
+                if notifier:
+                    last_summary_date = maybe_send_daily_summary(notifier, tracker, last_summary_date)
 
             consecutive_errors = 0  # healthy tick
 
@@ -96,14 +99,13 @@ def run() -> None:
             print(f"[error] {e}\n{traceback.format_exc()}")
             if notifier:
                 notifier.send(f"⚠️ Bot error: `{e}` (#{consecutive_errors})")
-            # Self-healing: exponential backoff on repeated failure
             if consecutive_errors >= 3:
                 backoff = min(300, config.POLL_INTERVAL_SECONDS * (2 ** (consecutive_errors - 2)))
                 print(f"[self-heal] backing off {backoff}s")
                 time.sleep(backoff)
                 continue
 
-        time.sleep(config.POLL_INTERVAL_SECONDS)
+        time.sleep(config.COMMAND_POLL_INTERVAL_SECONDS)
 
 
 def _close_callback(notifier, symbol):

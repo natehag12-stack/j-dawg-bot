@@ -41,6 +41,10 @@ BAYES_MODEL_PATH = os.getenv("BAYES_MODEL_PATH", "bayes_model.json")
 
 # --- Loop ---
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
+# Inbound Telegram commands (/status, /pnl, …) get checked at this faster
+# cadence so replies feel snappy. Market data still fetches every
+# POLL_INTERVAL_SECONDS to avoid rate limits.
+COMMAND_POLL_INTERVAL_SECONDS = int(os.getenv("COMMAND_POLL_INTERVAL_SECONDS", "5"))
 
 # --- Daily summary ---
 # When (ET) to push the daily P&L recap to Telegram. 16:15 = 15 min after NYSE close.
