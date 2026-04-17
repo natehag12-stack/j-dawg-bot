@@ -52,29 +52,38 @@ DAILY_SUMMARY_TIME = os.getenv("DAILY_SUMMARY_TIME", "16:15")
 
 # --- Paper trading ---
 # When True, log every fired signal as an open paper position, push an OPEN
-# notification, then push a CLOSE notification (with P&L in ticks) when it
+# notification, then push a CLOSE notification (with $ + tick P&L) when it
 # resolves. The bot does NOT place real orders — paper trading is the only mode.
 PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() in ("1", "true", "yes")
+PAPER_STARTING_BALANCE = float(os.getenv("PAPER_STARTING_BALANCE", "10000"))
+PAPER_RISK_PER_TRADE = float(os.getenv("PAPER_RISK_PER_TRADE", "100"))  # $ risked per trade
 
-# Tick size per symbol (price units per tick).
-# NQ/ES futures: 0.25.  ETFs/indices: 0.01.
+# Tick size + tick value per symbol.
+# Futures example: NQ=F tick is 0.25 pts and worth $5. QQQ tick is $0.01 / share.
 TICK_SIZES = {
-    "NQ=F": 0.25,
-    "MNQ=F": 0.25,
-    "ES=F": 0.25,
-    "MES=F": 0.25,
-    "RTY=F": 0.10,
-    "YM=F": 1.0,
-    "QQQ": 0.01,
-    "SPY": 0.01,
-    "IWM": 0.01,
-    "^NDX": 0.01,
-    "^GSPC": 0.01,
+    "NQ=F": 0.25, "MNQ=F": 0.25, "ES=F": 0.25, "MES=F": 0.25,
+    "RTY=F": 0.10, "MRTY=F": 0.10, "YM=F": 1.0, "MYM=F": 1.0,
+    "QQQ": 0.01, "SPY": 0.01, "IWM": 0.01,
+    "^NDX": 0.01, "^GSPC": 0.01,
+}
+TICK_VALUES = {  # USD per tick per contract (futures) or per share (ETF)
+    "NQ=F": 5.00, "MNQ=F": 0.50,
+    "ES=F": 12.50, "MES=F": 1.25,
+    "RTY=F": 5.00, "MRTY=F": 0.50,
+    "YM=F": 5.00, "MYM=F": 0.50,
+    "QQQ": 0.01, "SPY": 0.01, "IWM": 0.01,
+    "^NDX": 0.01, "^GSPC": 0.01,
 }
 DEFAULT_TICK_SIZE = 0.01
+DEFAULT_TICK_VALUE = 0.01
 
 def tick_size(symbol: str) -> float:
     return TICK_SIZES.get(symbol, DEFAULT_TICK_SIZE)
+
+def tick_value(symbol: str) -> float:
+    return TICK_VALUES.get(symbol, DEFAULT_TICK_VALUE)
+
+PAPER_STATE_PATH = os.getenv("PAPER_STATE_PATH", "paper_state.json")
 
 # --- Self-learning / adaptive threshold ---
 # When True, the bot nudges its per-symbol confidence threshold up after a

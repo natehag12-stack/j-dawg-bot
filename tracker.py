@@ -40,6 +40,8 @@ CREATE INDEX IF NOT EXISTS idx_signals_bar_ts  ON signals(bar_ts);
 
 _MIGRATIONS = [
     "ALTER TABLE signals ADD COLUMN exit_price REAL",
+    "ALTER TABLE signals ADD COLUMN pnl_dollars REAL",
+    "ALTER TABLE signals ADD COLUMN units REAL",
 ]
 
 
@@ -96,20 +98,32 @@ class Tracker:
             )
             return cur.lastrowid
 
-    def close_signal(self, signal_id: int, outcome: str, pnl_r: float, exit_price: float | None = None) -> None:
+    def close_signal(
+        self,
+        signal_id: int,
+        outcome: str,
+        pnl_r: float,
+        exit_price: float | None = None,
+        pnl_dollars: float | None = None,
+    ) -> None:
         with self._conn() as c:
             c.execute(
                 """UPDATE signals
-                   SET outcome=?, pnl_r=?, exit_price=?, closed_at=?
+                   SET outcome=?, pnl_r=?, exit_price=?, pnl_dollars=?, closed_at=?
                    WHERE id=?""",
                 (
                     outcome,
                     float(pnl_r),
                     float(exit_price) if exit_price is not None else None,
+                    float(pnl_dollars) if pnl_dollars is not None else None,
                     datetime.now(timezone.utc).isoformat(),
                     signal_id,
                 ),
             )
+
+    def set_units(self, signal_id: int, units: float) -> None:
+        with self._conn() as c:
+            c.execute("UPDATE signals SET units=? WHERE id=?", (float(units), signal_id))
 
     # ---------- reads ----------
     def pending_signals(self) -> list[sqlite3.Row]:
@@ -129,7 +143,8 @@ class Tracker:
                     SUM(CASE WHEN outcome='win'  THEN 1 ELSE 0 END) AS wins,
                     SUM(CASE WHEN outcome='loss' THEN 1 ELSE 0 END) AS losses,
                     SUM(CASE WHEN outcome='pending' THEN 1 ELSE 0 END) AS pending,
-                    SUM(pnl_r) AS total_r
+                    SUM(pnl_r) AS total_r,
+                    SUM(pnl_dollars) AS pnl_dollars
                 FROM signals"""
         params: tuple = ()
         if symbol:
@@ -207,12 +222,18 @@ def check_outcome(row: sqlite3.Row, df: pd.DataFrame) -> tuple[str, float, float
     return None
 
 
-def reconcile_pending(tracker: Tracker, df: pd.DataFrame, bayes, on_close=None, symbol: str | None = None) -> int:
+def reconcile_pending(
+    tracker: Tracker,
+    df: pd.DataFrame,
+    bayes,
+    on_close=None,
+    symbol: str | None = None,
+    pnl_dollars_fn=None,
+) -> int:
     """
-    Close out any pending signals whose outcome is now known, and feed the Bayesian model.
-    If `symbol` is given, only reconciles signals for that symbol (others are skipped — their
-    own loop iteration will pick them up with the right price data).
-    `on_close(row, outcome, pnl_r, exit_price, exit_reason)` fires per closure.
+    Close out any pending signals whose outcome is now known.
+    `pnl_dollars_fn(row, exit_price)` returns realised $ P&L (signed).
+    `on_close(row, outcome, pnl_r, pnl_dollars, exit_price, exit_reason)` fires per closure.
     """
     closed = 0
     for row in tracker.pending_signals():
@@ -222,11 +243,12 @@ def reconcile_pending(tracker: Tracker, df: pd.DataFrame, bayes, on_close=None, 
         if result is None:
             continue
         outcome, pnl_r, exit_price, exit_reason = result
-        tracker.close_signal(row["id"], outcome, pnl_r, exit_price)
+        pnl_dollars = pnl_dollars_fn(row, exit_price) if pnl_dollars_fn else None
+        tracker.close_signal(row["id"], outcome, pnl_r, exit_price, pnl_dollars)
         bayes.update(row["symbol"], row["side"], outcome == "win")
         if on_close:
             try:
-                on_close(row, outcome, pnl_r, exit_price, exit_reason)
+                on_close(row, outcome, pnl_r, pnl_dollars, exit_price, exit_reason)
             except Exception as e:
                 print(f"[reconcile] on_close error: {e}")
         closed += 1
