@@ -109,22 +109,20 @@ class BayesianModel:
 
     # ---------- summary ----------
     def summary(self, symbols: Iterable[str] | None = None) -> str:
+        return "\n".join(self.summary_lines(symbols))
+
+    def summary_lines(self, symbols: Iterable[str] | None = None) -> list[str]:
         if symbols is None:
             keys = list(self.symbols.keys()) or [_LEGACY_KEY]
         else:
             keys = list(symbols)
         lines = []
         for sym in keys:
-            wL = self._state(sym)["alpha_long"] - 1
-            lL = self._state(sym)["beta_long"] - 1
-            wS = self._state(sym)["alpha_short"] - 1
-            lS = self._state(sym)["beta_short"] - 1
-            mL = self.posterior_mean(sym, "long")
-            cL = self.posterior_lcb(sym, "long")
-            mS = self.posterior_mean(sym, "short")
-            cS = self.posterior_lcb(sym, "short")
+            nL = self.samples(sym, "long")
+            nS = self.samples(sym, "short")
+            mL = self.posterior_mean(sym, "long") * 100
+            mS = self.posterior_mean(sym, "short") * 100
             lines.append(
-                f"{sym:<8} L:{int(wL)}-{int(lL)} mean={mL:.2f} lcb={cL:.2f}  "
-                f"S:{int(wS)}-{int(lS)} mean={mS:.2f} lcb={cS:.2f}"
+                f"{sym:<6} L {mL:3.0f}% (n={nL:>2})   S {mS:3.0f}% (n={nS:>2})"
             )
-        return "\n".join(lines)
+        return lines

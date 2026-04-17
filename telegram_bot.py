@@ -1,10 +1,14 @@
 """
 Telegram notifier — zero deps beyond `requests`.
 
-Also supports lightweight polling for inbound commands like /stats.
+Also supports lightweight polling for inbound commands like /status.
 """
 from __future__ import annotations
 import requests
+
+
+def _fmt_price(p: float) -> str:
+    return f"{p:,.2f}"
 
 
 class TelegramNotifier:
@@ -12,8 +16,9 @@ class TelegramNotifier:
         self.token = token
         self.chat_id = str(chat_id)
         self.base = f"https://api.telegram.org/bot{token}"
-        self._last_update_id = 0  # for getUpdates long-poll cursor
+        self._last_update_id = 0
 
+    # ---------- low-level ----------
     def send(self, text: str) -> None:
         try:
             r = requests.post(
@@ -31,6 +36,11 @@ class TelegramNotifier:
         except Exception as e:
             print(f"[telegram] error: {e}")
 
+    # ---------- outbound ----------
+    def send_startup(self, symbols, _bayes_summary: str = "") -> None:
+        symstr = " · ".join(symbols) if isinstance(symbols, (list, tuple)) else symbols
+        self.send(f"🤖 *J-Dawg online*\nWatching {symstr}")
+
     def send_signal(
         self,
         *,
@@ -45,26 +55,24 @@ class TelegramNotifier:
         tick_size: float = 0.01,
         paper: bool = True,
     ) -> None:
-        emoji = "🟢" if side == "long" else "🔴"
-        arrow = "▲" if side == "long" else "▼"
-        rr_risk = abs(entry - stop)
+        dot = "🟢" if side == "long" else "🔴"
+        risk = abs(entry - stop)
         reward = abs(target - entry)
-        rr = reward / rr_risk if rr_risk else 0.0
-        risk_ticks = rr_risk / tick_size if tick_size else 0.0
-        reward_ticks = reward / tick_size if tick_size else 0.0
-        header = "📒 *PAPER OPEN*" if paper else "📣 *SIGNAL*"
+        rr = reward / risk if risk else 0.0
+        risk_t = int(round(risk / tick_size)) if tick_size else 0
+        rew_t = int(round(reward / tick_size)) if tick_size else 0
+        verb = "paper opened" if paper else "signal"
 
         msg = (
-            f"{header}  {emoji} *{side.upper()} — {symbol}* {arrow}\n"
+            f"{dot} *{side.upper()} {symbol}* — {verb}\n"
             f"```\n"
-            f"Entry  : {entry:,.2f}\n"
-            f"Stop   : {stop:,.2f}  ({risk_ticks:.0f} ticks risk)\n"
-            f"Target : {target:,.2f}  ({reward_ticks:.0f} ticks goal)\n"
-            f"R:R    : 1:{rr:.2f}\n"
+            f"Entry   {_fmt_price(entry)}\n"
+            f"Stop    {_fmt_price(stop)}   −{risk_t}t\n"
+            f"Target  {_fmt_price(target)}  +{rew_t}t\n"
+            f"RR      1:{rr:.2f}\n"
             f"```\n"
-            f"*Model confidence:* `{confidence*100:.1f}%`  "
-            f"_(after {samples} closed trades)_\n"
-            f"*Setup:* {reason}"
+            f"Confidence {confidence*100:.0f}%  (n={samples})\n"
+            f"_{reason}_"
         )
         self.send(msg)
 
@@ -85,91 +93,87 @@ class TelegramNotifier:
         else:
             ticks = (entry - exit_price) / tick_size if tick_size else 0.0
         won = pnl_r > 0
-        emoji = "✅" if won else "❌"
+        dot = "✅" if won else "❌"
         verdict = "WIN" if won else "LOSS"
+
         msg = (
-            f"{emoji} *PAPER CLOSE — {symbol} {side.upper()}*  ({verdict})\n"
+            f"{dot} *{symbol} {side.upper()} closed — {verdict}*\n"
             f"```\n"
-            f"Entry  : {entry:,.2f}\n"
-            f"Exit   : {exit_price:,.2f}\n"
-            f"P&L    : {ticks:+.0f} ticks  ({pnl_r:+.2f}R)\n"
-            f"Held   : {held}\n"
-            f"Reason : {exit_reason}\n"
+            f"{_fmt_price(entry)} → {_fmt_price(exit_price)}\n"
+            f"{ticks:+.0f} ticks   ({pnl_r:+.2f}R)\n"
+            f"held {held}  ·  {exit_reason}\n"
             f"```"
         )
         self.send(msg)
 
-    def send_startup(self, symbols, bayes_summary: str) -> None:
-        if isinstance(symbols, (list, tuple)):
-            symstr = ", ".join(symbols)
-        else:
-            symstr = symbols
-        self.send(
-            f"🤖 *J-Dawg Bot online*\n"
-            f"Watching *{symstr}* on 5m with 1H bias filter.\n\n"
-            f"```\n{bayes_summary}\n```"
-        )
-
     def send_daily_summary(self, date_str: str, rows: list, per_symbol: dict) -> None:
         wins = sum(1 for r in rows if r["outcome"] == "win")
         losses = sum(1 for r in rows if r["outcome"] == "loss")
-        total_r = sum((r["pnl_r"] or 0.0) for r in rows)
         n = wins + losses
         wr = (wins / n * 100) if n else 0.0
-        body = (
-            f"Trades : {n}\n"
-            f"Wins   : {wins}\n"
-            f"Losses : {losses}\n"
-            f"Win %  : {wr:.1f}%\n"
-            f"Net R  : {total_r:+.2f}"
-        )
+        net = sum((r["pnl_r"] or 0.0) for r in rows)
+
+        if n == 0:
+            self.send(f"📅 *Daily recap · {date_str}*\nNo trades closed today.")
+            return
+
         per_lines = []
         for sym, s in per_symbol.items():
             sn = s["wins"] + s["losses"]
             swr = (s["wins"] / sn * 100) if sn else 0.0
-            per_lines.append(f"{sym:<8} {sn:>2}t  {swr:5.1f}%  {s['pnl_r']:+.2f}R")
-        per_block = ("\n".join(per_lines)) if per_lines else "(no trades)"
-        self.send(
-            f"📊 *Daily P&L — {date_str}*\n"
-            f"```\n{body}\n```\n"
-            f"*Per symbol:*\n```\n{per_block}\n```"
-        )
+            per_lines.append(f"{sym:<6} {sn:>2}t   {swr:4.0f}%   {s['pnl_r']:+.2f}R")
 
-    def send_stats(self, overall: dict, per_symbol: dict, bayes_summary: str, thresholds: dict | None = None) -> None:
+        msg = (
+            f"📅 *Daily recap · {date_str}*\n"
+            f"{n}t · {wins}W / {losses}L · {wr:.0f}%  ·  net {net:+.2f}R\n"
+            f"```\n" + "\n".join(per_lines) + "\n```"
+        )
+        self.send(msg)
+
+    def send_stats(
+        self,
+        overall: dict,
+        per_symbol: dict,
+        bayes_lines: list[str] | None = None,
+        thresholds: dict | None = None,
+    ) -> None:
         n = overall["wins"] + overall["losses"]
         wr = (overall["wins"] / n * 100) if n else 0.0
-        body = (
-            f"Total trades : {n}\n"
-            f"Wins         : {overall['wins']}\n"
-            f"Losses       : {overall['losses']}\n"
-            f"Pending      : {overall['pending']}\n"
-            f"Win %        : {wr:.1f}%\n"
-            f"Net R        : {overall['total_r']:+.2f}"
-        )
+        net = overall["total_r"]
+
+        if n == 0:
+            head = "no closed trades yet"
+        else:
+            head = f"{n}t · {overall['wins']}W / {overall['losses']}L · {wr:.0f}%  ·  net {net:+.2f}R"
+        pending = overall["pending"]
+        head += f"\n_{pending} open_" if pending else ""
+
+        per_block = ""
         per_lines = []
         for sym, s in per_symbol.items():
             sn = s["wins"] + s["losses"]
+            if sn == 0 and not s["pending"]:
+                continue
             swr = (s["wins"] / sn * 100) if sn else 0.0
-            per_lines.append(f"{sym:<8} {sn:>3}t  {swr:5.1f}%  {s['total_r']:+.2f}R")
-        per_block = ("\n".join(per_lines)) if per_lines else "(no trades)"
+            per_lines.append(f"{sym:<6} {sn:>2}t   {swr:4.0f}%   {s['total_r']:+.2f}R")
+        if per_lines:
+            per_block = "\n*By symbol*\n```\n" + "\n".join(per_lines) + "\n```"
+
+        bayes_block = ""
+        if bayes_lines:
+            bayes_block = "\n*Bayesian win-rate*\n```\n" + "\n".join(bayes_lines) + "\n```"
+
         thresh_block = ""
         if thresholds:
-            tlines = [f"{k:<20} {v:.2f}" for k, v in sorted(thresholds.items())]
-            thresh_block = f"\n*Adaptive thresholds:*\n```\n" + "\n".join(tlines) + "\n```"
-        self.send(
-            f"📈 *J-Dawg stats*\n"
-            f"```\n{body}\n```\n"
-            f"*Per symbol:*\n```\n{per_block}\n```\n"
-            f"*Bayesian:*\n```\n{bayes_summary}\n```"
-            f"{thresh_block}"
-        )
+            tlines = [f"{k:<14} {v:.2f}" for k, v in sorted(thresholds.items())]
+            if tlines:
+                thresh_block = "\n*Adaptive thresholds*\n```\n" + "\n".join(tlines) + "\n```"
+
+        msg = f"📊 *J-Dawg stats*\n{head}{per_block}{bayes_block}{thresh_block}"
+        self.send(msg)
 
     # ---------- inbound polling ----------
     def poll_commands(self) -> list[str]:
-        """
-        Returns the list of NEW message texts since last call (only from configured chat).
-        Non-blocking: uses short timeout so it slots into the main loop cleanly.
-        """
         try:
             r = requests.get(
                 f"{self.base}/getUpdates",

@@ -254,7 +254,7 @@ def handle_commands(
             notifier.send_stats(
                 overall,
                 per_symbol,
-                bayes.summary(config.SYMBOLS),
+                bayes_lines=bayes.summary_lines(config.SYMBOLS),
                 thresholds=thresholds,
             )
         elif cmd in _HELP_CMDS:
@@ -296,7 +296,7 @@ def maybe_send_daily_summary(
             s["losses"] += 1
         s["pnl_r"] += r["pnl_r"] or 0.0
 
-    notifier.send_daily_summary(now_et.strftime("%Y-%m-%d"), rows, per_symbol)
+    notifier.send_daily_summary(f"{now_et.strftime('%a %b')} {now_et.day}", rows, per_symbol)
     return now_et.date()
 
 
